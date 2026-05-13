@@ -196,6 +196,16 @@ export interface TTSConfig {
   queryParams?: Record<string, string>;
   /** 自定义速度（默认不传） */
   speed?: number;
+  /** TTS 协议：openai（默认）或 minimax（走 /v1/t2a_v2） */
+  protocol?: "openai" | "minimax";
+  /** MiniMax 专属：音量 0~10（默认 1） */
+  vol?: number;
+  /** MiniMax 专属：音调 -12~12（默认 0） */
+  pitch?: number;
+  /** MiniMax 专属：采样率（默认 32000） */
+  sampleRate?: number;
+  /** MiniMax 专属：比特率（默认 128000） */
+  bitrate?: number;
 }
 
 function resolveTTSFromBlock(
@@ -208,6 +218,7 @@ function resolveTTSFromBlock(
   const voice: string = block?.voice || "alloy";
   if (!baseUrl || !apiKey) return null;
 
+  const protocol = (block?.protocol || providerCfg?.protocol) === "minimax" ? "minimax" as const : "openai" as const;
   const authStyle = (block?.authStyle || providerCfg?.authStyle) === "api-key" ? "api-key" as const : "bearer" as const;
   const queryParams: Record<string, string> = { ...(providerCfg?.queryParams ?? {}), ...(block?.queryParams ?? {}) };
   const speed: number | undefined = block?.speed;
@@ -218,8 +229,15 @@ function resolveTTSFromBlock(
     model,
     voice,
     authStyle,
+    protocol,
     ...(Object.keys(queryParams).length > 0 ? { queryParams } : {}),
     ...(speed !== undefined ? { speed } : {}),
+    ...(protocol === "minimax" ? {
+      vol: block?.vol ?? 1,
+      pitch: block?.pitch ?? 0,
+      sampleRate: block?.sampleRate ?? 32000,
+      bitrate: block?.bitrate ?? 128000,
+    } : {}),
   };
 }
 
@@ -271,10 +289,121 @@ function buildTTSRequest(ttsCfg: TTSConfig): { url: string; headers: Record<stri
   return { url, headers };
 }
 
+/**
+ * MiniMax T2A v2 协议：POST /v1/t2a_v2
+ * 响应是 JSON，音频在 data.audio 字段中以 hex 编码返回（mp3）
+ */
+async function minimaxTTS(
+  text: string,
+  ttsCfg: TTSConfig,
+): Promise<{ pcmBuffer: Buffer; sampleRate: number }> {
+  const outSampleRate = 24000;
+  const mmSampleRate = ttsCfg.sampleRate ?? 32000;
+  const url = `${ttsCfg.baseUrl}/v1/t2a_v2`;
+
+  const body = {
+    model: ttsCfg.model,
+    text,
+    stream: false,
+    language_boost: "auto",
+    output_format: "hex",
+    voice_setting: {
+      voice_id: ttsCfg.voice,
+      speed: ttsCfg.speed ?? 1,
+      vol: ttsCfg.vol ?? 1,
+      pitch: ttsCfg.pitch ?? 0,
+    },
+    audio_setting: {
+      sample_rate: mmSampleRate,
+      bitrate: ttsCfg.bitrate ?? 128000,
+      format: "mp3",
+      channel: 1,
+    },
+  };
+
+  console.log(`[tts:minimax] Request: model=${ttsCfg.model}, voice=${ttsCfg.voice}, url=${url}`);
+  console.log(`[tts:minimax] Input text (${text.length} chars): "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`);
+
+  const startTime = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+
+  try {
+    const fetchStart = Date.now();
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${ttsCfg.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
+
+    const fetchMs = Date.now() - fetchStart;
+
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => "");
+      console.log(`[tts:minimax] HTTP ${resp.status} (${fetchMs}ms): ${detail.slice(0, 300)}`);
+      throw new Error(`MiniMax TTS failed (HTTP ${resp.status}): ${detail.slice(0, 300)}`);
+    }
+
+    const data = await resp.json() as {
+      base_resp?: { status_code?: number; status_msg?: string };
+      data?: { audio?: string };
+    };
+
+    if (data.base_resp?.status_code !== 0) {
+      const msg = data.base_resp?.status_msg ?? "unknown error";
+      console.log(`[tts:minimax] API error: ${msg}`);
+      throw new Error(`MiniMax TTS API error: ${msg}`);
+    }
+
+    const audioHex = data.data?.audio;
+    if (!audioHex) {
+      throw new Error("MiniMax TTS: response missing data.audio");
+    }
+
+    const mp3Buffer = Buffer.from(audioHex, "hex");
+    console.log(`[tts:minimax] Response OK: mp3 ${mp3Buffer.length} bytes, latency=${fetchMs}ms`);
+
+    // mp3 → PCM，复用现有解码流水线
+    const tmpDir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "tts-mm-"));
+    const tmpMp3 = path.join(tmpDir, "tts.mp3");
+    fs.writeFileSync(tmpMp3, mp3Buffer);
+
+    try {
+      const ffmpegCmd = await checkFfmpeg();
+      if (ffmpegCmd) {
+        const pcmBuf = await ffmpegToPCM(ffmpegCmd, tmpMp3, outSampleRate);
+        console.log(`[tts:minimax] Done: mp3→PCM (ffmpeg), ${pcmBuf.length} bytes, total=${Date.now() - startTime}ms`);
+        return { pcmBuffer: pcmBuf, sampleRate: outSampleRate };
+      }
+      const pcmBuf = await wasmDecodeMp3ToPCM(mp3Buffer, outSampleRate);
+      if (pcmBuf) {
+        console.log(`[tts:minimax] Done: mp3→PCM (wasm), ${pcmBuf.length} bytes, total=${Date.now() - startTime}ms`);
+        return { pcmBuffer: pcmBuf, sampleRate: outSampleRate };
+      }
+      throw new Error("No decoder available for mp3 (install ffmpeg for best compatibility)");
+    } finally {
+      try { fs.unlinkSync(tmpMp3); fs.rmdirSync(tmpDir); } catch {}
+    }
+  } catch (err) {
+    clearTimeout(timeout);
+    const e = err instanceof Error ? err : new Error(String(err));
+    console.log(`[tts:minimax] Error: ${e.message.slice(0, 200)}`);
+    throw e;
+  }
+}
+
 export async function textToSpeechPCM(
   text: string,
   ttsCfg: TTSConfig,
 ): Promise<{ pcmBuffer: Buffer; sampleRate: number }> {
+  if (ttsCfg.protocol === "minimax") {
+    return minimaxTTS(text, ttsCfg);
+  }
+
   const sampleRate = 24000;
   const { url, headers } = buildTTSRequest(ttsCfg);
 
